@@ -1,3 +1,4 @@
+
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -212,20 +213,6 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     offset ^= 0x1F;
 
     dirty_loop_constants_ |= (1 << offset);
-  } else if (index == XE_GPU_REG_DC_LUT_PWL_DATA) {
-    UpdateGammaRampValue(GammaRampType::kPWL, value);
-  } else if (index == XE_GPU_REG_DC_LUT_30_COLOR) {
-    UpdateGammaRampValue(GammaRampType::kNormal, value);
-  } else if (index >= XE_GPU_REG_DC_LUT_RW_MODE &&
-             index <= XE_GPU_REG_DC_LUTA_CONTROL) {
-    uint32_t offset = index - XE_GPU_REG_DC_LUT_RW_MODE;
-    offset ^= 0x05;
-
-    dirty_gamma_constants_ |= (1 << offset);
-
-    if (index == XE_GPU_REG_DC_LUT_RW_INDEX) {
-      gamma_ramp_rw_subindex_ = 0;
-    }
   }
 }
 
@@ -450,11 +437,11 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     barrier.srcAccessMask =
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    barrier.oldLayout = texture->image_layout;
-    barrier.newLayout = texture->image_layout;
+    barrier.oldLayout = texture->base_region->image_layout;
+    barrier.newLayout = texture->base_region->image_layout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = texture->image;
+    barrier.image = texture->base_region->image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     vkCmdPipelineBarrier(copy_commands,
@@ -487,7 +474,9 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
 
     blitter_->BlitTexture2D(
         copy_commands, current_batch_fence_,
-        texture_cache_->DemandView(texture, 0x688)->view, src_rect,
+        texture_cache_->DemandTextureRegionView(texture->base_region, 0x688)
+            ->view,
+        src_rect,
         {texture->texture_info.width + 1, texture->texture_info.height + 1},
         VK_FORMAT_R8G8B8A8_UNORM, dst_rect,
         {frontbuffer_width, frontbuffer_height}, fb_framebuffer_, viewport,
@@ -553,9 +542,9 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     }
   }
 
-  vkWaitForFences(*device_, 1, &current_batch_fence_, VK_TRUE, -1);
   if (cache_clear_requested_) {
     cache_clear_requested_ = false;
+    vkWaitForFences(*device_, 1, &current_batch_fence_, VK_TRUE, -1);
 
     buffer_cache_->ClearCache();
     pipeline_cache_->ClearCache();
@@ -822,10 +811,6 @@ bool VulkanCommandProcessor::PopulateVertexBuffers(
   assert_true(vertex_bindings.size() <= 32);
   auto descriptor_set = buffer_cache_->PrepareVertexSet(
       setup_buffer, current_batch_fence_, vertex_bindings);
-  if (!descriptor_set) {
-    XELOGW("Failed to prepare vertex set!");
-    return false;
-  }
 
   vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           pipeline_cache_->pipeline_layout(), 2, 1,
@@ -843,11 +828,11 @@ bool VulkanCommandProcessor::PopulateSamplers(VkCommandBuffer command_buffer,
 
   std::vector<xe::gpu::Shader::TextureBinding> dummy_bindings;
   auto descriptor_set = texture_cache_->PrepareTextureSet(
-      setup_buffer, current_batch_fence_, vertex_shader->texture_bindings(),
+      command_buffer, setup_buffer, current_batch_fence_,
+      vertex_shader->texture_bindings(),
       pixel_shader ? pixel_shader->texture_bindings() : dummy_bindings);
   if (!descriptor_set) {
     // Unable to bind set.
-    XELOGW("Failed to prepare texture set!");
     return false;
   }
 
@@ -999,22 +984,25 @@ bool VulkanCommandProcessor::IssueCopy() {
   DepthRenderTargetFormat depth_format;
   if (is_color_source) {
     // Source from a color target.
-    reg::RB_COLOR_INFO color_info[4] = {
+    uint32_t color_info[4] = {
         regs[XE_GPU_REG_RB_COLOR_INFO].u32,
         regs[XE_GPU_REG_RB_COLOR1_INFO].u32,
         regs[XE_GPU_REG_RB_COLOR2_INFO].u32,
         regs[XE_GPU_REG_RB_COLOR3_INFO].u32,
     };
-    color_edram_base = color_info[copy_src_select].color_base;
-    color_format = color_info[copy_src_select].color_format;
-    assert_true(color_info[copy_src_select].color_exp_bias == 0);
+    color_edram_base = color_info[copy_src_select] & 0xFFF;
+
+    color_format = static_cast<ColorRenderTargetFormat>(
+        (color_info[copy_src_select] >> 16) & 0xF);
   }
 
   if (!is_color_source || depth_clear_enabled) {
     // Source from or clear a depth target.
-    reg::RB_DEPTH_INFO depth_info = {regs[XE_GPU_REG_RB_DEPTH_INFO].u32};
-    depth_edram_base = depth_info.depth_base;
-    depth_format = depth_info.depth_format;
+    uint32_t depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO].u32;
+    depth_edram_base = depth_info & 0xFFF;
+
+    depth_format =
+        static_cast<DepthRenderTargetFormat>((depth_info >> 16) & 0x1);
     if (!is_color_source) {
       copy_dest_format = DepthRenderTargetToTextureFormat(depth_format);
     }
@@ -1028,19 +1016,19 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   // Demand a resolve texture from the texture cache.
   TextureInfo texture_info;
-  TextureInfo::PrepareResolve(
-      copy_dest_base, copy_dest_format, resolve_endian, copy_dest_pitch,
-      dest_logical_width, std::max(1u, dest_logical_height), 1, &texture_info);
+  TextureInfo::PrepareResolve(copy_dest_base, copy_dest_format, resolve_endian,
+                              dest_logical_width,
+                              std::max(1u, dest_logical_height), &texture_info);
 
   auto texture = texture_cache_->DemandResolveTexture(texture_info);
   if (!texture) {
     // Out of memory.
-    XELOGD("Failed to demand resolve texture!");
     return false;
   }
 
-  if (!(texture->usage_flags & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
+  if (!(texture->base_region->usage_flags &
+        (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
     // Resolve image doesn't support drawing, and we don't support conversion.
     return false;
   }
@@ -1048,7 +1036,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   texture->in_flight_fence = current_batch_fence_;
 
   // For debugging purposes only (trace viewer)
-  last_copy_base_ = texture->texture_info.memory.base_address;
+  last_copy_base_ = texture->texture_info.guest_address;
 
   if (!frame_open_) {
     BeginFrame();
@@ -1059,7 +1047,15 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
   auto command_buffer = current_command_buffer_;
 
-  if (texture->image_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+  // Mark all regions of the texture (except base region, which we will write
+  // to) as invalid
+  for (auto region_it = texture->regions.begin();
+       region_it != texture->regions.end(); ++region_it) {
+    (*region_it)->region_contents_valid = false;
+  }
+  texture->base_region->region_contents_valid = true;
+
+  if (texture->base_region->image_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
     // Transition the image to a general layout.
     VkImageMemoryBarrier image_barrier;
     image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1070,13 +1066,13 @@ bool VulkanCommandProcessor::IssueCopy() {
     image_barrier.dstAccessMask = 0;
     image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    image_barrier.image = texture->image;
+    image_barrier.image = texture->base_region->image;
     image_barrier.subresourceRange = {0, 0, 1, 0, 1};
     image_barrier.subresourceRange.aspectMask =
         is_color_source
             ? VK_IMAGE_ASPECT_COLOR_BIT
             : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-    texture->image_layout = VK_IMAGE_LAYOUT_GENERAL;
+    texture->base_region->image_layout = VK_IMAGE_LAYOUT_GENERAL;
 
     vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
@@ -1094,11 +1090,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   image_barrier.dstAccessMask =
       is_color_source ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
                       : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  image_barrier.oldLayout = texture->image_layout;
+  image_barrier.oldLayout = texture->base_region->image_layout;
   image_barrier.newLayout =
       is_color_source ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                       : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-  image_barrier.image = texture->image;
+  image_barrier.image = texture->base_region->image;
   image_barrier.subresourceRange = {0, 0, 1, 0, 1};
   image_barrier.subresourceRange.aspectMask =
       is_color_source ? VK_IMAGE_ASPECT_COLOR_BIT
@@ -1113,10 +1109,6 @@ bool VulkanCommandProcessor::IssueCopy() {
   uint32_t src_format = is_color_source ? static_cast<uint32_t>(color_format)
                                         : static_cast<uint32_t>(depth_format);
   VkFilter filter = is_color_source ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-
-  XELOGGPU("Resolve RT %.8X %.8X(%d) -> 0x%.8X (%dx%d, format: %s)", edram_base,
-           surface_pitch, surface_pitch, copy_dest_base, copy_dest_pitch,
-           copy_dest_height, texture_info.format_info()->name);
   switch (copy_command) {
     case CopyCommand::kRaw:
       /*
@@ -1143,7 +1135,6 @@ bool VulkanCommandProcessor::IssueCopy() {
       auto view = render_cache_->FindTileView(
           edram_base, surface_pitch, surface_msaa, is_color_source, src_format);
       if (!view) {
-        XELOGGPU("Failed to find tile view!");
         break;
       }
 
@@ -1177,7 +1168,8 @@ bool VulkanCommandProcessor::IssueCopy() {
 
       // Create a framebuffer containing our image.
       if (!texture->framebuffer) {
-        auto texture_view = texture_cache_->DemandView(texture, 0x688);
+        auto texture_view = texture_cache_->DemandTextureRegionView(
+            texture->base_region, 0x688);
 
         VkFramebufferCreateInfo fb_create_info = {
             VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
@@ -1324,4 +1316,4 @@ bool VulkanCommandProcessor::IssueCopy() {
 
 }  // namespace vulkan
 }  // namespace gpu
-}  // namespace xe
+} // namespace xe
