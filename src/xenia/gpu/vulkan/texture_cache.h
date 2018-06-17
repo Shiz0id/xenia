@@ -16,7 +16,6 @@
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/shader.h"
-#include "xenia/gpu/texture_conversion.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
@@ -35,30 +34,11 @@ namespace vulkan {
 //
 class TextureCache {
  public:
-  struct TextureView;
+  struct TextureRegion;
+  struct Texture;
 
-  // This represents an uploaded Vulkan texture.
-  struct Texture {
-    TextureInfo texture_info;
-    std::vector<std::unique_ptr<TextureView>> views;
-
-    VkFormat format;
-    VkImage image;
-    VkImageLayout image_layout;
-    VmaAllocation alloc;
-    VmaAllocationInfo alloc_info;
-    VkFramebuffer framebuffer;  // Blit target frame buffer.
-    VkImageUsageFlags usage_flags;
-
-    uintptr_t access_watch_handle;
-    bool pending_invalidation;
-
-    // Pointer to the latest usage fence.
-    VkFence in_flight_fence;
-  };
-
-  struct TextureView {
-    Texture* texture;
+  struct TextureRegionView {
+    TextureRegion* region;
     VkImageView view;
 
     union {
@@ -73,6 +53,42 @@ class TextureCache {
 
       uint16_t swizzle;
     };
+  };
+
+  struct TextureRegion {
+    Texture* texture;
+
+    std::vector<std::unique_ptr<TextureRegionView>> views;
+
+    VkOffset3D region_offset;
+    VkExtent3D region_size;
+
+    VkImage image;
+    VkImageLayout image_layout;
+    VkImageUsageFlags usage_flags;
+    VmaAllocation allocation;
+    VmaAllocationInfo allocation_info;
+
+    bool region_contents_valid;
+  };
+
+  // This represents an uploaded Vulkan texture. A texture has a base image
+  // region containing its full content area, and zero or more regions
+  // that are crops of that base region.
+  struct Texture {
+    TextureInfo texture_info;
+    VkFormat format;
+
+    std::vector<std::unique_ptr<TextureRegion>> regions;
+
+    TextureRegion* base_region;  // Base region representing the entire image.
+    VkFramebuffer framebuffer;   // Blit target frame buffer.
+
+    uintptr_t access_watch_handle;
+    bool pending_invalidation;
+
+    // Pointer to the latest usage fence.
+    VkFence in_flight_fence;
   };
 
   TextureCache(Memory* memory, RegisterFile* register_file,
@@ -92,8 +108,12 @@ class TextureCache {
   // bindings. The textures will be uploaded/converted/etc as needed.
   // Requires a fence to be provided that will be signaled when finished
   // using the returned descriptor set.
+  // The setup buffer may be flushed to the device if we run out of space.
+  // The command buffer may be transitioned out of a render pass if an
+  // upload is performed to fill a dirty texture region.
   VkDescriptorSet PrepareTextureSet(
-      VkCommandBuffer setup_command_buffer, VkFence completion_fence,
+      VkCommandBuffer command_buffer, VkCommandBuffer setup_buffer,
+      VkFence completion_fence,
       const std::vector<Shader::TextureBinding>& vertex_bindings,
       const std::vector<Shader::TextureBinding>& pixel_bindings);
 
@@ -110,7 +130,7 @@ class TextureCache {
                          uint32_t height, TextureFormat format,
                          VkOffset2D* out_offset = nullptr);
 
-  TextureView* DemandView(Texture* texture, uint16_t swizzle);
+  TextureRegionView* DemandTextureRegionView(TextureRegion*, uint16_t swizzle);
 
   // Demands a texture for the purpose of resolving from EDRAM. This either
   // creates a new texture or returns a previously created texture.
@@ -133,35 +153,33 @@ class TextureCache {
 
   // Allocates a new texture and memory to back it on the GPU.
   Texture* AllocateTexture(const TextureInfo& texture_info,
-                           VkFormatFeatureFlags required_flags =
-                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+                           VkFormatFeatureFlags required_flags);
   bool FreeTexture(Texture* texture);
 
   static void WatchCallback(void* context_ptr, void* data_ptr,
                             uint32_t address);
+  TextureRegion* AllocateTextureRegion(Texture*, VkOffset3D region_offset,
+                                       VkExtent3D region_size,
+                                       VkFormatFeatureFlags required_flags);
 
   // Demands a texture. If command_buffer is null and the texture hasn't been
   // uploaded to graphics memory already, we will return null and bail.
-  Texture* Demand(const TextureInfo& texture_info,
-                  VkCommandBuffer command_buffer = nullptr,
-                  VkFence completion_fence = nullptr);
+  TextureRegion* DemandRegion(const TextureInfo& texture_info,
+                              VkCommandBuffer command_buffer,
+                              VkCommandBuffer setup_buffer,
+                              VkFence completion_fence = nullptr);
   Sampler* Demand(const SamplerInfo& sampler_info);
 
-  void FlushPendingCommands(VkCommandBuffer command_buffer,
+  void FlushPendingCommands(VkCommandBuffer setup_buffer,
                             VkFence completion_fence);
 
+  bool ConvertTexture2D(uint8_t* dest, VkBufferImageCopy* copy_region,
+                        uint32_t mip, const TextureInfo& src);
+  bool ConvertTextureCube(uint8_t* dest, VkBufferImageCopy* copy_regions,
+                          const TextureInfo& src);
   bool ConvertTexture(uint8_t* dest, VkBufferImageCopy* copy_region,
                       uint32_t mip, const TextureInfo& src);
-
-  static const FormatInfo* GetFormatInfo(TextureFormat format);
-  static texture_conversion::CopyBlockCallback GetFormatCopyBlock(
-      TextureFormat format);
-  static TextureExtent GetMipExtent(const TextureInfo& src, uint32_t mip);
-  static uint32_t ComputeMipStorage(const FormatInfo* format_info,
-                                    uint32_t width, uint32_t height,
-                                    uint32_t depth, uint32_t mip);
-  static uint32_t ComputeMipStorage(const TextureInfo& src, uint32_t mip);
-  static uint32_t ComputeTextureStorage(const TextureInfo& src);
+  bool ComputeTextureStorage(size_t* output_length, const TextureInfo& src);
 
   // Writes a texture back into guest memory. This call is (mostly) asynchronous
   // but the texture must not be flagged for destruction.
@@ -170,16 +188,17 @@ class TextureCache {
   // Queues commands to upload a texture from system memory, applying any
   // conversions necessary. This may flush the command buffer to the GPU if we
   // run out of staging memory.
-  bool UploadTexture(VkCommandBuffer command_buffer, VkFence completion_fence,
+  bool UploadTexture(VkCommandBuffer setup_buffer, VkFence completion_fence,
                      Texture* dest, const TextureInfo& src);
 
   void HashTextureBindings(XXH64_state_t* hash_state, uint32_t& fetch_mask,
                            const std::vector<Shader::TextureBinding>& bindings);
   bool SetupTextureBindings(
-      VkCommandBuffer command_buffer, VkFence completion_fence,
-      UpdateSetInfo* update_set_info,
+      VkCommandBuffer command_buffer, VkCommandBuffer setup_buffer,
+      VkFence completion_fence, UpdateSetInfo* update_set_info,
       const std::vector<Shader::TextureBinding>& bindings);
   bool SetupTextureBinding(VkCommandBuffer command_buffer,
+                           VkCommandBuffer setup_buffer,
                            VkFence completion_fence,
                            UpdateSetInfo* update_set_info,
                            const Shader::TextureBinding& binding);
@@ -225,4 +244,4 @@ class TextureCache {
 }  // namespace gpu
 }  // namespace xe
 
-#endif  // XENIA_GPU_VULKAN_TEXTURE_CACHE_H_
+#endif // XENIA_GPU_VULKAN_TEXTURE_CACHE_H_
