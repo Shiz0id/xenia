@@ -380,6 +380,7 @@ class RenderCache {
     reg::RB_COLOR_INFO rb_color2_info;
     reg::RB_COLOR_INFO rb_color3_info;
     reg::RB_DEPTH_INFO rb_depth_info;
+    uint32_t rb_color_mask;
     uint32_t pa_sc_window_scissor_tl;
     uint32_t pa_sc_window_scissor_br;
 
@@ -400,4 +401,4 @@ class RenderCache {
 }  // namespace gpu
 }  // namespace xe
 
-#endif  // XENIA_GPU_VULKAN_RENDER_CACHE_H_
+#endif // XENIA_GPU_VULKAN_RENDER_CACHE_H_
