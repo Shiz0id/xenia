@@ -28,30 +28,19 @@ using xe::ui::vulkan::CheckResult;
 
 constexpr uint32_t kEdramBufferCapacity = 10 * 1024 * 1024;
 
-ColorRenderTargetFormat GetBaseRTFormat(ColorRenderTargetFormat format) {
-  switch (format) {
-    case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      return ColorRenderTargetFormat::k_8_8_8_8;
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
-      return ColorRenderTargetFormat::k_2_10_10_10;
-    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-      return ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
-    default:
-      return format;
-  }
-}
-
 VkFormat ColorRenderTargetFormatToVkFormat(ColorRenderTargetFormat format) {
   switch (format) {
     case ColorRenderTargetFormat::k_8_8_8_8:
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
       return VK_FORMAT_R8G8B8A8_UNORM;
     case ColorRenderTargetFormat::k_2_10_10_10:
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
+    case ColorRenderTargetFormat::k_2_10_10_10_unknown:
       return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
     case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
+      // WARNING: this is wrong, most likely - no float form in vulkan?
+      XELOGW("Unsupported EDRAM format k_2_10_10_10_FLOAT used");
+      return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
     case ColorRenderTargetFormat::k_16_16:
       return VK_FORMAT_R16G16_UNORM;
     case ColorRenderTargetFormat::k_16_16_16_16:
@@ -231,10 +220,8 @@ VkResult CachedTileView::Initialize(VkCommandBuffer command_buffer) {
 
   device_->DbgSetObjectName(
       reinterpret_cast<uint64_t>(image), VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
-      xe::format_string("RT(d): 0x%.8X 0x%.8X(%d) 0x%.8X(%d) %d %d %d",
-                        key.tile_offset, key.tile_width, key.tile_width,
-                        key.tile_height, key.tile_height, key.color_or_depth,
-                        key.msaa_samples, key.edram_format));
+      xe::format_string("RT %.8X %.8X(%d)", key.tile_offset, key.tile_width,
+                        key.tile_width));
 
   VkMemoryRequirements memory_requirements;
   vkGetImageMemoryRequirements(*device_, image, &memory_requirements);
@@ -654,6 +641,7 @@ bool RenderCache::dirty() const {
   dirty |= cur_regs.rb_color2_info.value != regs[XE_GPU_REG_RB_COLOR2_INFO].u32;
   dirty |= cur_regs.rb_color3_info.value != regs[XE_GPU_REG_RB_COLOR3_INFO].u32;
   dirty |= cur_regs.rb_depth_info.value != regs[XE_GPU_REG_RB_DEPTH_INFO].u32;
+  dirty |= cur_regs.rb_color_mask != regs[XE_GPU_REG_RB_COLOR_MASK].u32;
   dirty |= cur_regs.pa_sc_window_scissor_tl !=
            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL].u32;
   dirty |= cur_regs.pa_sc_window_scissor_br !=
@@ -672,6 +660,7 @@ const RenderState* RenderCache::BeginRenderPass(VkCommandBuffer command_buffer,
   current_command_buffer_ = command_buffer;
 
   // Lookup or construct a render pass compatible with our current state.
+  auto previous_render_pass = current_state_.render_pass;
   auto config = &current_state_.config;
   CachedRenderPass* render_pass = nullptr;
   CachedFramebuffer* framebuffer = nullptr;
@@ -691,6 +680,7 @@ const RenderState* RenderCache::BeginRenderPass(VkCommandBuffer command_buffer,
       SetShadowRegister(&regs.rb_color3_info.value, XE_GPU_REG_RB_COLOR3_INFO);
   dirty |=
       SetShadowRegister(&regs.rb_depth_info.value, XE_GPU_REG_RB_DEPTH_INFO);
+  dirty |= SetShadowRegister(&regs.rb_color_mask, XE_GPU_REG_RB_COLOR_MASK);
   dirty |= SetShadowRegister(&regs.pa_sc_window_scissor_tl,
                              XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL);
   dirty |= SetShadowRegister(&regs.pa_sc_window_scissor_br,
@@ -724,14 +714,12 @@ const RenderState* RenderCache::BeginRenderPass(VkCommandBuffer command_buffer,
     if (depth_target && current_state_.config.depth_stencil.used) {
       UpdateTileView(command_buffer, depth_target, true);
     }
-
     // Color
     for (int i = 0; i < 4; i++) {
       auto target = current_state_.framebuffer->color_attachments[i];
       if (!target || !current_state_.config.color[i].used) {
         continue;
       }
-
       UpdateTileView(command_buffer, target, true);
     }
     */
@@ -815,7 +803,23 @@ bool RenderCache::ParseConfiguration(RenderConfiguration* config) {
     };
     for (int i = 0; i < 4; ++i) {
       config->color[i].edram_base = color_info[i].color_base;
-      config->color[i].format = GetBaseRTFormat(color_info[i].color_format);
+      config->color[i].format = color_info[i].color_format;
+      config->color[i].used = ((regs.rb_color_mask >> (i * 4)) & 0xf) != 0;
+      // We don't support GAMMA formats, so switch them to what we do support.
+      switch (config->color[i].format) {
+        case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+          config->color[i].format = ColorRenderTargetFormat::k_8_8_8_8;
+          break;
+        case ColorRenderTargetFormat::k_2_10_10_10_unknown:
+          config->color[i].format = ColorRenderTargetFormat::k_2_10_10_10;
+          break;
+        case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
+          config->color[i].format = ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
+          break;
+        default:
+          // The rest are good
+          break;
+      }
     }
   } else {
     for (int i = 0; i < 4; ++i) {
@@ -830,6 +834,7 @@ bool RenderCache::ParseConfiguration(RenderConfiguration* config) {
       config->mode_control == ModeControl::kDepth) {
     config->depth_stencil.edram_base = regs.rb_depth_info.depth_base;
     config->depth_stencil.format = regs.rb_depth_info.depth_format;
+    config->depth_stencil.used = true;
   } else {
     config->depth_stencil.edram_base = 0;
     config->depth_stencil.format = DepthRenderTargetFormat::kD24S8;
@@ -964,8 +969,20 @@ CachedTileView* RenderCache::FindTileView(uint32_t base, uint32_t pitch,
 
   if (color_or_depth) {
     // Adjust similar formats for easier matching.
-    format = static_cast<uint32_t>(
-        GetBaseRTFormat(static_cast<ColorRenderTargetFormat>(format)));
+    switch (static_cast<ColorRenderTargetFormat>(format)) {
+      case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        format = uint32_t(ColorRenderTargetFormat::k_8_8_8_8);
+        break;
+      case ColorRenderTargetFormat::k_2_10_10_10_unknown:
+        format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10);
+        break;
+      case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
+        format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
+        break;
+      default:
+        // Other types as-is.
+        break;
+    }
   }
 
   TileViewKey key;
@@ -1089,27 +1106,22 @@ void RenderCache::EndRenderPass() {
   // TODO(DrChat): Determine if we actually need an EDRAM buffer.
   /*
   std::vector<CachedTileView*> cached_views;
-
   // Depth
   auto depth_target = current_state_.framebuffer->depth_stencil_attachment;
   if (depth_target && current_state_.config.depth_stencil.used) {
     cached_views.push_back(depth_target);
   }
-
   // Color
   for (int i = 0; i < 4; i++) {
     auto target = current_state_.framebuffer->color_attachments[i];
     if (!target || !current_state_.config.color[i].used) {
       continue;
     }
-
     cached_views.push_back(target);
   }
-
   std::sort(
       cached_views.begin(), cached_views.end(),
       [](CachedTileView const* a, CachedTileView const* b) { return *a < *b; });
-
   for (auto view : cached_views) {
     UpdateTileView(current_command_buffer_, view, false, false);
   }
@@ -1201,8 +1213,20 @@ void RenderCache::BlitToImage(VkCommandBuffer command_buffer,
                               VkExtent3D extents) {
   if (color_or_depth) {
     // Adjust similar formats for easier matching.
-    format = static_cast<uint32_t>(
-        GetBaseRTFormat(static_cast<ColorRenderTargetFormat>(format)));
+    switch (static_cast<ColorRenderTargetFormat>(format)) {
+      case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        format = uint32_t(ColorRenderTargetFormat::k_8_8_8_8);
+        break;
+      case ColorRenderTargetFormat::k_2_10_10_10_unknown:
+        format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10);
+        break;
+      case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
+        format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
+        break;
+      default:
+        // Rest are OK
+        break;
+    }
   }
 
   uint32_t tile_width = num_samples == MsaaSamples::k4X ? 40 : 80;
@@ -1305,7 +1329,20 @@ void RenderCache::ClearEDRAMColor(VkCommandBuffer command_buffer,
   // need to detect this and calculate a value.
 
   // Adjust similar formats for easier matching.
-  format = GetBaseRTFormat(static_cast<ColorRenderTargetFormat>(format));
+  switch (format) {
+    case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+      format = ColorRenderTargetFormat::k_8_8_8_8;
+      break;
+    case ColorRenderTargetFormat::k_2_10_10_10_unknown:
+      format = ColorRenderTargetFormat::k_2_10_10_10;
+      break;
+    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
+      format = ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
+      break;
+    default:
+      // Rest are OK
+      break;
+  }
 
   uint32_t tile_width = num_samples == MsaaSamples::k4X ? 40 : 80;
   uint32_t tile_height = num_samples != MsaaSamples::k1X ? 8 : 16;
@@ -1389,4 +1426,4 @@ bool RenderCache::SetShadowRegister(uint32_t* dest, uint32_t register_name) {
 
 }  // namespace vulkan
 }  // namespace gpu
-}  // namespace xe
+} // namespace xe
